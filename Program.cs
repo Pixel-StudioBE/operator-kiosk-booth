@@ -14,6 +14,7 @@ const string DiscoveryMessage = "DISCOVER_BOOTH_V1";
 const int RetryDelayMs = 2000;
 const int DiscoveryWindowMs = 10_000;
 const string PersistedFileName = "booth-discovery.json";
+const string PersistedFolderName = "Guestcam\\operator-utils-app";
 
 using var loggerFactory = LoggerFactory.Create(builder =>
 {
@@ -39,7 +40,9 @@ Console.CancelKeyPress += (_, e) =>
 };
 
 var state = new DiscoveryState();
-var persistence = new BoothPersistence(Path.Combine(AppContext.BaseDirectory, PersistedFileName), logger);
+var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+var persistencePath = Path.Combine(programData, PersistedFolderName, PersistedFileName);
+var persistence = new BoothPersistence(persistencePath, logger);
 persistence.TryLoad(state);
 
 var client = new BoothDiscoveryClient(logger, DiscoveryPort, DiscoveryMessage, RetryDelayMs);
@@ -400,6 +403,7 @@ internal sealed class BoothPersistence
     {
         _path = path;
         _logger = logger;
+        EnsureDirectory();
     }
 
     public void TryLoad(DiscoveryState state)
@@ -457,6 +461,7 @@ internal sealed class BoothPersistence
         var tempPath = _path + ".tmp";
         var json = JsonSerializer.Serialize(persisted, JsonOptions);
 
+        EnsureDirectory();
         File.WriteAllText(tempPath, json);
         File.Copy(tempPath, _path, true);
         File.Delete(tempPath);
@@ -477,6 +482,17 @@ internal sealed class BoothPersistence
         {
             _logger.LogWarning(ex, "Failed to delete persisted booth settings at {Path}", _path);
         }
+    }
+
+    private void EnsureDirectory()
+    {
+        var directory = Path.GetDirectoryName(_path);
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(directory);
     }
 
     private static BoothDiscoveryInfo? MapToInfo(PersistedBoothInfo? persisted)
