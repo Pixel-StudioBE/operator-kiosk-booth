@@ -12,6 +12,8 @@ using Microsoft.Extensions.Logging;
 const int DiscoveryPort = 54545;
 const string DiscoveryMessage = "DISCOVER_BOOTH_V1";
 const int RetryDelayMs = 2000;
+const int DiscoveryWindowMs = 10_000;
+const string PersistedFileName = "booth-discovery.json";
 
 using var loggerFactory = LoggerFactory.Create(builder =>
 {
@@ -37,39 +39,180 @@ Console.CancelKeyPress += (_, e) =>
 };
 
 var state = new DiscoveryState();
+var persistence = new BoothPersistence(Path.Combine(AppContext.BaseDirectory, PersistedFileName), logger);
+persistence.TryLoad(state);
+
 var client = new BoothDiscoveryClient(logger, DiscoveryPort, DiscoveryMessage, RetryDelayMs);
-
-_ = Task.Run(async () =>
-{
-    var booth = await client.DiscoverAsync(cts.Token);
-    if (booth is null)
-    {
-        logger.LogWarning("Discovery canceled before a Booth was found");
-        return;
-    }
-
-    state.Url = $"http://{booth.Endpoint.Address}:{booth.Endpoint.Port}";
-    state.NodeId = booth.NodeId;
-    state.Version = booth.Version;
-    state.IsReady = true;
-}, cts.Token);
+var discoveryService = new BoothDiscoveryService(client, state, persistence, TimeSpan.FromMilliseconds(DiscoveryWindowMs), logger);
+discoveryService.Start(cts.Token);
 
 var builder = WebApplication.CreateBuilder();
 builder.WebHost.UseUrls("http://127.0.0.1:7777");
 
 var app = builder.Build();
+
 app.MapGet("/booth", () =>
 {
-    if (!state.IsReady)
+    lock (state.Sync)
     {
+        if (state.Selected is not null)
+        {
+            return Results.Json(BoothPayload.Ready(state.Selected));
+        }
+
+        if (state.Discovered.Count > 1)
+        {
+            var booths = state.Discovered.Select(BoothPayload.ForList).ToArray();
+            return Results.Json(new { status = "select", booths });
+        }
+
+        if (state.Discovered.Count == 1)
+        {
+            state.Selected = state.Discovered[0];
+            persistence.Save(state);
+            return Results.Json(BoothPayload.Ready(state.Selected));
+        }
+
         return Results.Json(new { status = "discovering" });
     }
+});
 
-    return Results.Json(new { status = "ready", url = state.Url });
+app.MapPost("/booth/select", async (HttpRequest request) =>
+{
+    var selection = await request.ReadFromJsonAsync<BoothSelectionRequest>();
+    if (selection is null || string.IsNullOrWhiteSpace(selection.Ip) || selection.UiPort is null)
+    {
+        return Results.BadRequest(new { error = "ip and uiPort are required" });
+    }
+
+    BoothDiscoveryInfo? selected = null;
+
+    lock (state.Sync)
+    {
+        selected = state.Discovered.FirstOrDefault(info =>
+            info.Endpoint.Address.ToString() == selection.Ip &&
+            info.Endpoint.Port == selection.UiPort.Value);
+
+        if (selected is null)
+        {
+            return Results.NotFound(new { error = "booth not found" });
+        }
+
+        state.Selected = selected;
+        persistence.Save(state);
+    }
+
+    return Results.Json(BoothPayload.Ready(selected));
+});
+
+app.MapPost("/booth/clear", () =>
+{
+    discoveryService.Reset();
+    return Results.Json(new { status = "cleared" });
 });
 
 await app.StartAsync(cts.Token);
 await app.WaitForShutdownAsync(cts.Token);
+
+internal sealed class BoothDiscoveryService
+{
+    private readonly BoothDiscoveryClient _client;
+    private readonly DiscoveryState _state;
+    private readonly BoothPersistence _persistence;
+    private readonly TimeSpan _window;
+    private readonly ILogger _logger;
+    private CancellationTokenSource _resetCts = new();
+
+    public BoothDiscoveryService(
+        BoothDiscoveryClient client,
+        DiscoveryState state,
+        BoothPersistence persistence,
+        TimeSpan window,
+        ILogger logger)
+    {
+        _client = client;
+        _state = state;
+        _persistence = persistence;
+        _window = window;
+        _logger = logger;
+    }
+
+    public void Start(CancellationToken applicationToken)
+    {
+        _ = Task.Run(() => RunAsync(applicationToken), applicationToken);
+    }
+
+    public void Reset()
+    {
+        lock (_state.Sync)
+        {
+            _state.Clear();
+        }
+
+        _persistence.Clear();
+
+        var previous = Interlocked.Exchange(ref _resetCts, new CancellationTokenSource());
+        previous.Cancel();
+        previous.Dispose();
+    }
+
+    private async Task RunAsync(CancellationToken applicationToken)
+    {
+        while (!applicationToken.IsCancellationRequested)
+        {
+            BoothDiscoveryInfo? selected;
+            bool discoveryComplete;
+
+            lock (_state.Sync)
+            {
+                selected = _state.Selected;
+                discoveryComplete = _state.DiscoveryComplete;
+            }
+
+            if (selected is not null || discoveryComplete)
+            {
+                await Task.Delay(500, applicationToken);
+                continue;
+            }
+
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(applicationToken, _resetCts.Token);
+            IReadOnlyList<BoothDiscoveryInfo> discovered;
+
+            try
+            {
+                discovered = await _client.DiscoverAllAsync(_window, linkedCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                continue;
+            }
+
+            if (linkedCts.IsCancellationRequested)
+            {
+                continue;
+            }
+
+            if (discovered.Count == 0)
+            {
+                _logger.LogInformation("No Booth responses received during discovery window");
+                continue;
+            }
+
+            lock (_state.Sync)
+            {
+                _state.Discovered = discovered.ToList();
+                _state.DiscoveryComplete = true;
+
+                if (_state.Discovered.Count == 1)
+                {
+                    _state.Selected = _state.Discovered[0];
+                }
+            }
+
+            _persistence.Save(_state);
+        }
+    }
+}
 
 internal sealed class BoothDiscoveryClient
 {
@@ -86,7 +229,7 @@ internal sealed class BoothDiscoveryClient
         _retryDelayMs = retryDelayMs;
     }
 
-    public async Task<BoothDiscoveryInfo?> DiscoverAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<BoothDiscoveryInfo>> DiscoverAllAsync(TimeSpan window, CancellationToken cancellationToken)
     {
         using var udpClient = new UdpClient(0)
         {
@@ -97,20 +240,43 @@ internal sealed class BoothDiscoveryClient
 
         _logger.LogInformation("Broadcast targets {Targets}", string.Join(", ", broadcastTargets));
 
-        while (!cancellationToken.IsCancellationRequested)
+        await BroadcastDiscoveryAsync(udpClient, broadcastTargets, cancellationToken);
+
+        var discovered = new Dictionary<string, BoothDiscoveryInfo>(StringComparer.OrdinalIgnoreCase);
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(window);
+
+        while (!timeoutCts.IsCancellationRequested)
         {
-            await BroadcastDiscoveryAsync(udpClient, broadcastTargets, cancellationToken);
-
-            var found = await WaitForResponseAsync(udpClient, cancellationToken);
-            if (found is not null)
+            try
             {
-                return found;
-            }
+                var result = await udpClient.ReceiveAsync(timeoutCts.Token);
+                var responseText = Encoding.UTF8.GetString(result.Buffer);
+                _logger.LogInformation("Discovery response received from {Remote} {Payload}", result.RemoteEndPoint, responseText);
 
-            _logger.LogInformation("No Booth response yet. Retrying discovery");
+                var booth = ParseResponse(responseText);
+                if (booth is not null)
+                {
+                    var key = $"{booth.Endpoint.Address}:{booth.Endpoint.Port}";
+                    discovered[key] = booth;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Invalid JSON response received");
+            }
+            catch (SocketException ex)
+            {
+                _logger.LogWarning(ex, "Socket error while receiving responses");
+            }
         }
 
-        return null;
+        return discovered.Values.OrderBy(info => info.EventName).ThenBy(info => info.Endpoint.Address.ToString()).ToList();
     }
 
     private async Task BroadcastDiscoveryAsync(UdpClient udpClient, IReadOnlyList<IPEndPoint> targets, CancellationToken cancellationToken)
@@ -129,43 +295,6 @@ internal sealed class BoothDiscoveryClient
                 _logger.LogWarning(ex, "Failed to send discovery broadcast to {Target}", target);
             }
         }
-    }
-
-    private async Task<BoothDiscoveryInfo?> WaitForResponseAsync(UdpClient udpClient, CancellationToken cancellationToken)
-    {
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(_retryDelayMs);
-
-        while (!timeoutCts.IsCancellationRequested)
-        {
-            try
-            {
-                var result = await udpClient.ReceiveAsync(timeoutCts.Token);
-                var responseText = Encoding.UTF8.GetString(result.Buffer);
-                _logger.LogInformation("Discovery response received from {Remote} {Payload}", result.RemoteEndPoint, responseText);
-
-                var booth = ParseResponse(responseText);
-                if (booth is not null)
-                {
-                    _logger.LogInformation("Booth selected {BoothIp}:{BoothPort}", booth.Endpoint.Address, booth.Endpoint.Port);
-                    return booth;
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (JsonException ex)
-            {
-                _logger.LogWarning(ex, "Invalid JSON response received");
-            }
-            catch (SocketException ex)
-            {
-                _logger.LogWarning(ex, "Socket error while receiving responses");
-            }
-        }
-
-        return null;
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -196,7 +325,12 @@ internal sealed class BoothDiscoveryClient
             return null;
         }
 
-        return new BoothDiscoveryInfo(new IPEndPoint(ipAddress, response.UiPort.Value), response.NodeId, response.Version);
+        return new BoothDiscoveryInfo(
+            new IPEndPoint(ipAddress, response.UiPort.Value),
+            response.NodeId,
+            response.Version,
+            response.EventName,
+            response.ClientName);
     }
 
     private static IReadOnlyList<IPEndPoint> GetBroadcastTargets(int port)
@@ -252,15 +386,159 @@ internal sealed class BoothDiscoveryClient
     }
 }
 
-internal sealed class DiscoveryState
+internal sealed class BoothPersistence
 {
-    public volatile bool IsReady;
-    public string? Url;
-    public string? NodeId;
-    public string? Version;
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true
+    };
+
+    private readonly string _path;
+    private readonly ILogger _logger;
+
+    public BoothPersistence(string path, ILogger logger)
+    {
+        _path = path;
+        _logger = logger;
+    }
+
+    public void TryLoad(DiscoveryState state)
+    {
+        if (!File.Exists(_path))
+        {
+            return;
+        }
+
+        try
+        {
+            var json = File.ReadAllText(_path);
+            var persisted = JsonSerializer.Deserialize<PersistedBoothState>(json, JsonOptions);
+            if (persisted is null)
+            {
+                return;
+            }
+
+            lock (state.Sync)
+            {
+                state.Discovered = persisted.Discovered
+                    .Select(MapToInfo)
+                    .Where(info => info is not null)
+                    .Select(info => info!)
+                    .ToList();
+
+                state.Selected = MapToInfo(persisted.Selected);
+                state.DiscoveryComplete = state.Selected is not null || state.Discovered.Count > 0;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or JsonException)
+        {
+            _logger.LogWarning(ex, "Failed to load persisted booth settings from {Path}", _path);
+        }
+    }
+
+    public void Save(DiscoveryState state)
+    {
+        PersistedBoothState persisted;
+
+        lock (state.Sync)
+        {
+            persisted = new PersistedBoothState
+            {
+                SavedUtc = DateTime.UtcNow,
+                Selected = MapToPersisted(state.Selected),
+                Discovered = state.Discovered
+                    .Select(MapToPersisted)
+                    .Where(info => info is not null)
+                    .Select(info => info!)
+                    .ToList()
+            };
+        }
+
+        var tempPath = _path + ".tmp";
+        var json = JsonSerializer.Serialize(persisted, JsonOptions);
+
+        File.WriteAllText(tempPath, json);
+        File.Copy(tempPath, _path, true);
+        File.Delete(tempPath);
+    }
+
+    public void Clear()
+    {
+        if (!File.Exists(_path))
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(_path);
+        }
+        catch (IOException ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete persisted booth settings at {Path}", _path);
+        }
+    }
+
+    private static BoothDiscoveryInfo? MapToInfo(PersistedBoothInfo? persisted)
+    {
+        if (persisted is null || string.IsNullOrWhiteSpace(persisted.Ip) || persisted.UiPort <= 0)
+        {
+            return null;
+        }
+
+        if (!IPAddress.TryParse(persisted.Ip, out var ipAddress))
+        {
+            return null;
+        }
+
+        return new BoothDiscoveryInfo(
+            new IPEndPoint(ipAddress, persisted.UiPort),
+            persisted.NodeId,
+            persisted.Version,
+            persisted.EventName,
+            persisted.ClientName);
+    }
+
+    private static PersistedBoothInfo? MapToPersisted(BoothDiscoveryInfo? info)
+    {
+        if (info is null)
+        {
+            return null;
+        }
+
+        return new PersistedBoothInfo
+        {
+            Ip = info.Endpoint.Address.ToString(),
+            UiPort = info.Endpoint.Port,
+            NodeId = info.NodeId,
+            Version = info.Version,
+            EventName = info.EventName,
+            ClientName = info.ClientName
+        };
+    }
 }
 
-internal sealed record BoothDiscoveryInfo(IPEndPoint Endpoint, string? NodeId, string? Version);
+internal sealed class DiscoveryState
+{
+    public readonly object Sync = new();
+    public bool DiscoveryComplete;
+    public List<BoothDiscoveryInfo> Discovered = new();
+    public BoothDiscoveryInfo? Selected;
+
+    public void Clear()
+    {
+        DiscoveryComplete = false;
+        Discovered.Clear();
+        Selected = null;
+    }
+}
+
+internal sealed record BoothDiscoveryInfo(
+    IPEndPoint Endpoint,
+    string? NodeId,
+    string? Version,
+    string? EventName,
+    string? ClientName);
 
 internal sealed class BoothDiscoveryResponse
 {
@@ -269,4 +547,61 @@ internal sealed class BoothDiscoveryResponse
     public string? Ip { get; init; }
     public int? UiPort { get; init; }
     public string? Version { get; init; }
+    public string? EventName { get; init; }
+    public string? ClientName { get; init; }
+}
+
+internal sealed class BoothSelectionRequest
+{
+    public string? Ip { get; init; }
+    public int? UiPort { get; init; }
+}
+
+internal sealed class PersistedBoothState
+{
+    public DateTime? SavedUtc { get; set; }
+    public PersistedBoothInfo? Selected { get; set; }
+    public List<PersistedBoothInfo> Discovered { get; set; } = new();
+}
+
+internal sealed class PersistedBoothInfo
+{
+    public string? Ip { get; set; }
+    public int UiPort { get; set; }
+    public string? NodeId { get; set; }
+    public string? Version { get; set; }
+    public string? EventName { get; set; }
+    public string? ClientName { get; set; }
+}
+
+internal static class BoothPayload
+{
+    public static object Ready(BoothDiscoveryInfo booth)
+    {
+        return new
+        {
+            status = "ready",
+            url = BuildUrl(booth),
+            booth = ForList(booth)
+        };
+    }
+
+    public static object ForList(BoothDiscoveryInfo booth)
+    {
+        return new
+        {
+            ip = booth.Endpoint.Address.ToString(),
+            uiPort = booth.Endpoint.Port,
+            url = BuildUrl(booth),
+            eventName = booth.EventName,
+            clientName = booth.ClientName,
+            version = booth.Version,
+            nodeId = booth.NodeId
+        };
+    }
+
+    private static string BuildUrl(BoothDiscoveryInfo booth)
+    {
+        return $"http://{booth.Endpoint.Address}:{booth.Endpoint.Port}";
+    }
 }
